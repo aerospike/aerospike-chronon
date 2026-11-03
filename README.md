@@ -547,8 +547,8 @@ Requires JDK 17+ (the `ai.chronon` jars are compiled for Java 17) — run sbt wi
 Chronon, Spark, slf4j and logback left out because the host JVM supplies them:
 
 ```
-target/scala-2.12/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar   # Scala 2.12
-target/scala-2.13/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar   # Scala 2.13
+target/scala-2.12/aerospike-chronon-assembly-0.0.2-SNAPSHOT.jar   # Scala 2.12
+target/scala-2.13/aerospike-chronon-assembly-0.0.2-SNAPSHOT.jar   # Scala 2.13
 ```
 
 Use the jar whose Scala version matches the Chronon runtime (2.12 for the
@@ -561,7 +561,7 @@ Point Chronon's `run.py` at it:
 
 ```
 python run.py --mode=fetch \
-  --online-jar=target/scala-2.12/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar \
+  --online-jar=target/scala-2.12/aerospike-chronon-assembly-0.0.2-SNAPSHOT.jar \
   --online-class=com.aerospike.chronon.ChrononAerospikeApi \
   -Zaerospike.hosts=host1,host2 -Zaerospike.namespace=features ...
 ```
@@ -571,7 +571,7 @@ For bulk loads, submit the loader from the same jar:
 ```
 spark-submit --class com.aerospike.chronon.Spark2AerospikeLoader \
   [--conf spark.chronon.partition.column=dt --conf spark.chronon.partition.format=yyyyMMdd] \
-  target/scala-2.12/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar \
+  target/scala-2.12/aerospike-chronon-assembly-0.0.2-SNAPSHOT.jar \
   --table-name team.my_gb_upload --end-ds 2026-10-13 \
   --aerospike-hosts host1,host2 --namespace features --ttl 432000 [--allow-empty]
 ```
@@ -598,7 +598,8 @@ deploys it. Each Scala version publishes two artifacts under `com.aerospike`:
 - `aerospike-chronon_<scala>` — the library jar with sources, javadoc and a POM
   that declares its dependencies.
 - `aerospike-chronon-assembly_<scala>` — the online jar for `--online-jar`,
-  with a POM that declares no dependencies.
+  with a POM that declares no dependencies. It ships the library's sources and
+  javadoc jars, which Maven Central requires for every artifact.
 
 The workflow never runs on pull requests or merges; it has two triggers:
 
