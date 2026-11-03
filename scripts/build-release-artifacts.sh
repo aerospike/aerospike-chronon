@@ -3,9 +3,10 @@
 # one flat directory (default: dist/), for the JFrog deploy in .github/workflows/release.yml:
 #   aerospike-chronon_<scala>-<version>.{jar,pom}, -sources.jar, -javadoc.jar
 #       the library, with its dependencies declared in the POM
-#   aerospike-chronon-assembly_<scala>-<version>.{jar,pom}
+#   aerospike-chronon-assembly_<scala>-<version>.{jar,pom}, -sources.jar, -javadoc.jar
 #       the online jar Chronon loads (--online-jar). Its POM declares no
-#       dependencies because the jar already carries them.
+#       dependencies because the jar already carries them. Maven Central requires
+#       sources and javadoc for every artifact, so it reuses the library's.
 # <version> overrides ThisBuild / version in build.sbt, so a dev build can carry a
 # -dev.N version without editing the build.
 #
@@ -87,6 +88,20 @@ for module_dir in "${module_dirs[@]}"; do
   sed -e "0,/<artifactId>${artifact_id}<\/artifactId>/s//<artifactId>${assembly_id}<\/artifactId>/" \
     -e '/<dependencies>/,/<\/dependencies>/d' \
     "${module_dir}/${stem}.pom" >"${OUT_DIR}/${assembly_id}-${VERSION}.pom"
+
+  # The JFrog deploy takes coordinates from pom.properties, so the copies must name
+  # the assembly or they would be filed under the library.
+  props_dir="$(mktemp -d)"
+  mkdir -p "${props_dir}/META-INF/maven/com.aerospike/${assembly_id}"
+  printf 'groupId=com.aerospike\nartifactId=%s\nversion=%s\n' "${assembly_id}" "${VERSION}" \
+    >"${props_dir}/META-INF/maven/com.aerospike/${assembly_id}/pom.properties"
+  for classifier in sources javadoc; do
+    out_jar="$(cd "${OUT_DIR}" && pwd)/${assembly_id}-${VERSION}-${classifier}.jar"
+    cp "${module_dir}/${stem}-${classifier}.jar" "${out_jar}"
+    zip -qd "${out_jar}" "META-INF/maven/*"
+    (cd "${props_dir}" && zip -qr "${out_jar}" META-INF/maven)
+  done
+  rm -rf "${props_dir}"
 done
 
 echo "==> Artifacts emitted to ${OUT_DIR}:"
