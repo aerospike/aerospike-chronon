@@ -65,13 +65,37 @@ services:
 
   # Opt-in TLS fixtures: Enterprise Edition eval image (single-node feature
   # key baked in). TLS requires EE, so these stay profile-gated — CE users
-  # never start them. Run `docker/gen-tls-certs.sh` once first; the ITs do so
-  # automatically. Tested image: aerospike/aerospike-server-enterprise:8.2.0.1
-  # (override with AEROSPIKE_TLS_IMAGE).
+  # never start them. One command generates certificates and Java stores,
+  # starts both EE servers, provisions the password and PKI users on each,
+  # and reports readiness:
+  #
+  #   AEROSPIKE_TLS_UID=$(id -u) AEROSPIKE_TLS_GID=$(id -g) \
+  #     docker compose --profile tls run --rm tls-ready
+  #
+  # The UID/GID vars chown generated material to the host user; without them
+  # it stays container-owned and may be unreadable on native-Linux Docker.
+  #
+  # The TLS ITs (AerospikeTlsSpec) run the same command automatically.
+  # Server image override: AEROSPIKE_TLS_IMAGE.
+  tls-certs-init:
+    profiles: ["tls"]
+    image: ${AEROSPIKE_TLS_INIT_IMAGE:-eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a}
+    entrypoint: ["timeout", "180", "sh", "/scripts/gen-tls-certs.sh"]
+    environment:
+      AEROSPIKE_TLS_CERT_DIR: /certs
+      AEROSPIKE_TLS_UID: ${AEROSPIKE_TLS_UID:-}
+      AEROSPIKE_TLS_GID: ${AEROSPIKE_TLS_GID:-}
+    volumes:
+      - ./docker/gen-tls-certs.sh:/scripts/gen-tls-certs.sh:ro
+      - ${AEROSPIKE_TLS_CERT_DIR:-./docker/tls-certs}:/certs
+
   aerospike-tls:
     image: ${AEROSPIKE_TLS_IMAGE:-aerospike/aerospike-server-enterprise:8.2.0.1}
     container_name: aerospike-chronon-test-tls
     profiles: ["tls"]
+    depends_on:
+      tls-certs-init:
+        condition: service_completed_successfully
     cap_drop:
       - ALL
     cap_add:
@@ -85,7 +109,7 @@ services:
       - "127.0.0.1:4533:4333"
     volumes:
       - ./docker/aerospike-tls.conf:/etc/aerospike/aerospike.template.conf:ro
-      - ./docker/tls-certs:/opt/aerospike/certs:ro
+      - ${AEROSPIKE_TLS_CERT_DIR:-./docker/tls-certs}/server:/opt/aerospike/certs:ro
     healthcheck:
       test: ["CMD", "asinfo", "-v", "status", "-Uadmin", "-Padmin"]
       interval: 2s
@@ -97,6 +121,9 @@ services:
     image: ${AEROSPIKE_TLS_IMAGE:-aerospike/aerospike-server-enterprise:8.2.0.1}
     container_name: aerospike-chronon-test-tls-mtls
     profiles: ["tls"]
+    depends_on:
+      tls-certs-init:
+        condition: service_completed_successfully
     cap_drop:
       - ALL
     cap_add:
@@ -110,9 +137,37 @@ services:
       - "127.0.0.1:4534:4333"
     volumes:
       - ./docker/aerospike-tls-mtls.conf:/etc/aerospike/aerospike.template.conf:ro
-      - ./docker/tls-certs:/opt/aerospike/certs:ro
+      - ${AEROSPIKE_TLS_CERT_DIR:-./docker/tls-certs}/server:/opt/aerospike/certs:ro
     healthcheck:
       test: ["CMD", "asinfo", "-v", "status", "-Uadmin", "-Padmin"]
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # Provisions chronon-user (password) and chronon-client (PKI nopassword) on
+  # both servers over TLS through the service network — no docker exec, no
+  # fixed container names, no Docker socket. Reruns on every setup invocation
+  # so a recreated server is reprovisioned.
+  tls-provision:
+    profiles: ["tls"]
+    image: &tls-tools-image ${AEROSPIKE_TOOLS_IMAGE:-aerospike/aerospike-tools@sha256:90eda477fec8096b0c8a542143c6b9a7a4d4ceb0ac5d1b54c4a482cd94b69f67}
+    entrypoint: ["timeout", "300", "sh", "/scripts/provision-tls-users.sh"]
+    depends_on:
+      aerospike-tls:
+        condition: service_healthy
+      aerospike-tls-mtls:
+        condition: service_healthy
+    volumes:
+      - ./docker/provision-tls-users.sh:/scripts/provision-tls-users.sh:ro
+      - ${AEROSPIKE_TLS_CERT_DIR:-./docker/tls-certs}:/certs:ro
+
+  # Terminal setup target: `docker compose --profile tls run --rm tls-ready`
+  # runs the whole chain and exits nonzero unless provisioning verified both
+  # servers' user state and TLS authentication.
+  tls-ready:
+    profiles: ["tls"]
+    image: *tls-tools-image
+    entrypoint: ["sh", "-c", "echo 'TLS authentication ready; run the host TLS IT suite to verify record operations.'"]
+    depends_on:
+      tls-provision:
+        condition: service_completed_successfully

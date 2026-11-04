@@ -880,8 +880,25 @@ class AerospikeConfigSpec extends AnyFlatSpec with Matchers {
     l.credentials shouldBe conf.credentials
   }
 
+  /** A temp dir of loadable throwaway PKCS12 stores + a password file. The
+    * wiring under test only requires the stores to load — real cert material
+    * (and PKI auth) is exercised by the src/it TLS fixture, not here. */
+  private def fixtureStoresDir(): String = {
+    val dir = java.nio.file.Files.createTempDirectory("chronon-tls-stores")
+    val pw = "storepass".toCharArray
+    Seq("ca.truststore.p12", "client.keystore.p12").foreach { name =>
+      val ks = java.security.KeyStore.getInstance("PKCS12")
+      ks.load(null, pw)
+      val out = java.nio.file.Files.newOutputStream(dir.resolve(name))
+      try ks.store(out, pw) finally out.close()
+    }
+    java.nio.file.Files.write(dir.resolve("storepass.txt"),
+      "storepass".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    dir.toString
+  }
+
   "clientPolicyFor" should "wire tlsPolicy, clusterName, authMode and credentials" in {
-    val certs = new java.io.File("docker/tls-certs").getAbsolutePath
+    val certs = fixtureStoresDir()
     val realStores = retentionBase ++ Map(
       "aerospike.tls.enabled" -> "true",
       "aerospike.tls.truststore.file" -> s"$certs/ca.truststore.p12",
@@ -930,5 +947,12 @@ class AerospikeConfigSpec extends AnyFlatSpec with Matchers {
     pw.toFile.deleteOnExit()
     java.nio.file.Files.write(pw, "from-file\n".getBytes("UTF-8"))
     AerospikeClientHolder.resolvePassword(Credentials("u", Some(pw.toString), None), _ => Some("from-env")) shouldBe "from-file"
+  }
+
+  it should "name the config key and path when the password file is unreadable" in {
+    val ex = intercept[IllegalStateException](
+      AerospikeClientHolder.resolvePassword(Credentials("u", Some("/no/such/pw.txt"), None), _ => None))
+    ex.getMessage should include("aerospike.password.file")
+    ex.getMessage should include("/no/such/pw.txt")
   }
 }

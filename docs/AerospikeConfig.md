@@ -112,8 +112,11 @@ async path uses netty event loops (the direct-NIO loops cannot speak TLS), so
 netty 4.2 is bundled and **shaded** into the assembly jar
 (`chronon.shaded.io.netty.*`, along with `chronon.shaded.com.aerospike.client.*`),
 so TLS works out of the box even on hosts carrying netty 4.1 (Spark 3.5).
-Consumers of the thin `packageBin` jar instead get `io.netty` as a normal POM
-dependency and must have netty 4.2+ on their own classpath. Two cosmetic notes:
+Consumers of the thin `packageBin` jar instead get `io.netty` 4.2 as a normal
+POM dependency: on a host carrying netty 4.1 (e.g. Spark 3.5), enabling TLS
+requires either aligning the host's netty graph to 4.2+ or switching to the
+assembly jar — an unaligned classpath fails with linkage errors at client
+build. Two cosmetic notes:
 stack traces name the shaded classes, and JVM shutdown can log a harmless
 `ClassNotFoundException` for a shaded inner class (the shutdown-hook thread's
 context classloader cannot see them).
@@ -155,8 +158,38 @@ compatible).
 
 ### Test fixture
 
-`docker/gen-tls-certs.sh` generates throwaway certs + Java stores
-(`docker/tls-certs/`). The `tls` compose profile brings up EE 8.2.0.1 services
-on 4533 (server auth) and 4534 (mTLS required); `AerospikeDockerSpec.withTlsServers`
-manages them and provisions `chronon-user`/`chronon-pass` plus the
-`chronon-client` PKI user.
+One command owns the whole TLS fixture lifecycle — certificate and Java-store
+initialization, both EE 8.2.0.1 servers (4533 server auth, 4534 mTLS
+required), and provisioning of `chronon-user`/`chronon-pass` plus the
+`chronon-client` PKI-only user on each:
+
+```
+AEROSPIKE_TLS_UID=$(id -u) AEROSPIKE_TLS_GID=$(id -g) \
+  docker compose --profile tls run --rm tls-ready
+```
+
+Requires Docker Compose v5.1.3 or later. The `AEROSPIKE_TLS_UID`/`GID` vars
+chown generated material to your host user; without them it stays
+container-owned and may be unreadable on native-Linux Docker (Docker Desktop
+maps ownership, so it works either way). `AerospikeDockerSpec` runs the same
+command automatically — passing `id -u`/`id -g` itself — once per TLS suite
+and removes the fixture containers afterwards.
+
+Generated material lives in `docker/tls-certs/` (gitignored, host-readable).
+A complete valid set is reused across runs — fingerprints stay stable.
+Fixture certificates are valid for **30 days**; expired, partial, or
+inconsistent material is rejected rather than silently rotated. To reset:
+stop the TLS services (`docker compose --profile tls stop`), delete
+`docker/tls-certs/`, and rerun the setup command.
+
+Setup readiness means TLS authentication succeeded with the fixture client
+certificate and both users' roles/auth modes were verified on both servers —
+it deliberately does **not** perform record operations; the
+`AerospikeTlsSpec` round-trips remain the write/read verification.
+
+Container tooling: `eclipse-temurin:21-jdk` (digest-pinned) runs OpenSSL +
+`keytool` for cert/store generation (`openssl`-only PKCS12 cert bags load as
+zero trusted entries in the JDK, so `keytool` is mandatory), and
+`aerospike/aerospike-tools` (digest-pinned) runs `asadm`/`asinfo` for
+provisioning over the service network — no `docker exec`, Docker socket, or
+host tools required.

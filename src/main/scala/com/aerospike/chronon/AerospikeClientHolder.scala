@@ -225,16 +225,30 @@ object AerospikeClientHolder {
     * config parse, which on Spark runs on the driver): the trimmed contents of
     * the password file, or the named environment variable. A missing or blank
     * env var fails closed rather than building an unauthenticated client. */
+  private def readFile(key: String, path: String): Array[Byte] =
+    try Files.readAllBytes(Paths.get(path))
+    catch {
+      case e: java.io.IOException =>
+        throw new IllegalStateException(s"Could not read file '$path' configured by '$key': ${e.getMessage}", e)
+    }
+
+  private def openFile(key: String, path: String): java.io.InputStream =
+    try Files.newInputStream(Paths.get(path))
+    catch {
+      case e: java.io.IOException =>
+        throw new IllegalStateException(s"Could not read file '$path' configured by '$key': ${e.getMessage}", e)
+    }
+
   private[chronon] def resolvePassword(c: Credentials,
                                        env: String => Option[String] = n => Option(System.getenv(n))): String =
-    c.passwordFile.map(f => new String(Files.readAllBytes(Paths.get(f)), UTF_8).trim)
+    c.passwordFile.map(f => new String(readFile(AerospikeConfig.PasswordFileKey, f), UTF_8).trim)
       .orElse(c.passwordEnv.map { n =>
         env(n).map(_.trim).filter(_.nonEmpty).getOrElse(throw new IllegalStateException(
           s"Environment variable '$n' named by '${AerospikeConfig.PasswordEnvKey}' is not set or empty on this host"))
       }).orNull
 
-  private def readStorePassword(file: Option[String]): Array[Char] =
-    file.map(f => new String(Files.readAllBytes(Paths.get(f)), UTF_8).trim.toCharArray)
+  private def readStorePassword(key: String, file: Option[String]): Array[Char] =
+    file.map(f => new String(readFile(key, f), UTF_8).trim.toCharArray)
       .orNull
 
   /** Builds an `SSLContext` from the configured truststore and/or keystore.
@@ -243,20 +257,20 @@ object AerospikeClientHolder {
   private[chronon] def buildSslContext(t: TlsSettings): SSLContext = {
     val trustManagers = t.truststoreFile.map { f =>
       val ks = KeyStore.getInstance(t.truststoreType)
-      val in = Files.newInputStream(Paths.get(f))
-      try ks.load(in, readStorePassword(t.truststorePasswordFile))
+      val in = openFile(AerospikeConfig.TlsTruststoreFileKey, f)
+      try ks.load(in, readStorePassword(AerospikeConfig.TlsTruststorePasswordFileKey, t.truststorePasswordFile))
       finally in.close()
       val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm)
       tmf.init(ks)
       tmf.getTrustManagers
     }.orNull
     val keyManagers = t.keystoreFile.map { f =>
-      val storePassword = readStorePassword(t.keystorePasswordFile)
+      val storePassword = readStorePassword(AerospikeConfig.TlsKeystorePasswordFileKey, t.keystorePasswordFile)
       val keyPassword = t.keystoreKeyPasswordFile
-        .map(kf => new String(Files.readAllBytes(Paths.get(kf)), UTF_8).trim.toCharArray)
+        .map(kf => new String(readFile(AerospikeConfig.TlsKeystoreKeyPasswordFileKey, kf), UTF_8).trim.toCharArray)
         .getOrElse(storePassword)
       val ks = KeyStore.getInstance(t.keystoreType)
-      val in = Files.newInputStream(Paths.get(f))
+      val in = openFile(AerospikeConfig.TlsKeystoreFileKey, f)
       try ks.load(in, storePassword)
       finally in.close()
       val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm)

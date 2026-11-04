@@ -21,6 +21,7 @@ class AerospikeTlsSpec extends AnyFlatSpec with Matchers with AerospikeDockerSpe
   // skip the trait's `docker compose up` so it also runs when port 3000 is
   // taken by another project's rig.
   override protected def needsBaseRig: Boolean = false
+  override protected def needsTlsRig: Boolean = true
 
   private def bytes(s: String): Array[Byte] = s.getBytes(UTF_8)
   private val timeout = 30.seconds
