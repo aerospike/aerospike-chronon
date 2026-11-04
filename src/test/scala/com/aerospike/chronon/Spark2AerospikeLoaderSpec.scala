@@ -431,6 +431,58 @@ class Spark2AerospikeLoaderSpec extends AnyFlatSpec with Matchers {
       requiredArgs ++ Seq("--max-commands-in-process", "40")))
     capped.maxCommandsInProcess shouldBe Some(40)
   }
+
+  it should "map TLS and auth flags into the config, omitting them when unset" in {
+    val plain = AerospikeConfig.fromUserConf(Spark2AerospikeLoader.userConfFromArgs(requiredArgs))
+    plain.tls shouldBe None
+    plain.credentials shouldBe None
+    plain.authMode shouldBe AuthModeSetting.Internal
+
+    val conf = AerospikeConfig.fromUserConf(Spark2AerospikeLoader.userConfFromArgs(
+      requiredArgs.updated(5, "node1:aerospike-tls:4333") ++ Seq(
+      "--tls-enabled", "true",
+      "--tls-name", "aerospike-tls",
+      "--tls-protocols", "TLSv1.2,TLSv1.3",
+      "--tls-ciphers", "TLS_AES_256_GCM_SHA384",
+      "--tls-truststore-file", "/tls/ca.truststore.p12",
+      "--tls-truststore-password-file", "/tls/storepass.txt",
+      "--tls-truststore-type", "PKCS12",
+      "--tls-keystore-file", "/tls/client.keystore.p12",
+      "--tls-keystore-password-file", "/tls/storepass.txt",
+      "--tls-keystore-key-password-file", "/tls/keypass.txt",
+      "--tls-keystore-type", "PKCS12",
+      "--aerospike-user", "u",
+      "--aerospike-password-file", "/pw",
+      "--auth-mode", "internal")))
+    val t = conf.tls.get
+    t.tlsName shouldBe Some("aerospike-tls")
+    t.protocols shouldBe Some(Seq("TLSv1.2", "TLSv1.3"))
+    t.truststoreFile shouldBe Some("/tls/ca.truststore.p12")
+    t.truststoreType shouldBe "PKCS12"
+    t.keystoreFile shouldBe Some("/tls/client.keystore.p12")
+    t.keystoreKeyPasswordFile shouldBe Some("/tls/keypass.txt")
+    conf.hosts.map(h => (h.name, h.tlsName, h.port)) shouldBe
+      Seq(("node1", Some("aerospike-tls"), 4333))
+    conf.credentials shouldBe Some(Credentials("u", Some("/pw"), None))
+
+    // env-var credentials map as a NAME (resolved per executor), never a value
+    AerospikeConfig.fromUserConf(Spark2AerospikeLoader.userConfFromArgs(requiredArgs ++ Seq(
+      "--aerospike-user", "u", "--aerospike-password-env", "AS_PW"))).credentials shouldBe
+      Some(Credentials("u", None, Some("AS_PW")))
+
+    // pki + forLoginOnly flags also flow through
+    val pki = AerospikeConfig.fromUserConf(Spark2AerospikeLoader.userConfFromArgs(requiredArgs ++ Seq(
+      "--tls-enabled", "true",
+      "--tls-keystore-file", "/tls/client.keystore.p12",
+      "--tls-keystore-password-file", "/tls/storepass.txt",
+      "--auth-mode", "pki")))
+    pki.authMode shouldBe AuthModeSetting.Pki
+
+    // TLS flags without --tls-enabled fail fast, same as the userConf path
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(
+      Spark2AerospikeLoader.userConfFromArgs(requiredArgs ++ Seq("--tls-name", "x"))))
+      .getMessage should include("aerospike.tls.enabled")
+  }
 }
 
 object Spark2AerospikeLoaderSpec {

@@ -73,6 +73,13 @@ class AssemblyClassLoadingSpec extends AnyFlatSpec with Matchers with AerospikeD
       val resp = Await.result(
         store.multiGet(Seq(KVStore.GetRequest("asm-key".getBytes(UTF_8), "TEST_DATASET"))), 30.seconds).head
       new String(resp.values.get.head.bytes, UTF_8) shouldBe "asm-value"
+
+      // The shaded TLS stack must resolve inside the jar — the client's
+      // netty-based event loops only work when both the client and netty were
+      // relocated consistently.
+      child.loadClass("chronon.shaded.com.aerospike.client.async.NettyEventLoops")
+      child.loadClass("chronon.shaded.io.netty.channel.MultiThreadIoEventLoopGroup")
+      child.loadClass("chronon.shaded.io.netty.channel.nio.NioIoHandler")
     } finally child.close()
   }
 }

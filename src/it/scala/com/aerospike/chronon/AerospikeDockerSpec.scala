@@ -25,10 +25,31 @@ trait AerospikeDockerSpec extends BeforeAndAfterAll { this: Suite =>
   def newStore(conf: Map[String, String] = testUserConf): AerospikeKvStore =
     AerospikeKvStore(conf)
 
+  /** Suites that manage their own containers (e.g. the TLS fixture specs)
+    * override to false — the plaintext CE rig is not brought up for them. */
+  protected def needsBaseRig: Boolean = true
+
+  /** Suites using [[withTlsServers]] override to true — the EE TLS fixtures
+    * are brought up once for the whole suite and removed afterwards. */
+  protected def needsTlsRig: Boolean = false
+
   override def beforeAll(): Unit = {
     super.beforeAll()
-    val up = Process("docker compose up -d --wait", new java.io.File(".").getAbsoluteFile)
-    require(up.! == 0, "docker compose up -d --wait failed; is the rig defined in docker-compose.yml?")
+    if (needsBaseRig) {
+      val up = Process("docker compose up -d --wait", new java.io.File(".").getAbsoluteFile)
+      require(up.! == 0, "docker compose up -d --wait failed; is the rig defined in docker-compose.yml?")
+    }
+    if (needsTlsRig) {
+      val compose = new java.io.File(".").getAbsoluteFile
+      val up = Try(Process(
+        Seq("sh", "-c",
+          "AEROSPIKE_TLS_UID=$(id -u) AEROSPIKE_TLS_GID=$(id -g) " +
+          "docker compose --profile tls run --rm tls-ready"), compose).!)
+      up.foreach { rc =>
+        if (rc != 0) throw new org.scalatest.exceptions.TestCanceledException("docker compose tls-ready failed", 0)
+      }
+      if (up.isFailure) throw new org.scalatest.exceptions.TestCanceledException(s"docker unavailable: ${up.failed.get.getMessage}", 0)
+    }
     // Suites may share a forked JVM; drop any cached client from a previous container.
     AerospikeClientHolder.clear()
   }
@@ -37,13 +58,40 @@ trait AerospikeDockerSpec extends BeforeAndAfterAll { this: Suite =>
     // stop + rm, not `down`: the rig's network stays up so its deletion cannot
     // churn other stopped containers' network state (chronon-benchmark-aerospike).
     val compose = new java.io.File(".").getAbsoluteFile
-    Try(Process("docker compose stop --timeout 1", compose).!)
-    Try(Process("docker compose rm -f", compose).!)
+    if (needsBaseRig) {
+      Try(Process("docker compose stop --timeout 1", compose).!)
+      Try(Process("docker compose rm -f", compose).!)
+    }
+    if (needsTlsRig) {
+      tlsContainers.foreach(c => Try(Process(s"docker rm -f $c").!))
+    }
     super.afterAll()
   }
 
   val nsup0Port: Int           = 3100
   val nsup0Container: String   = "aerospike-chronon-test-nosup"
+
+  val tlsPort: Int                 = 4533
+  val mtlsPort: Int                = 4534
+  val tlsServerName: String        = "aerospike-tls"
+  val tlsContainers: Seq[String]   = Seq("aerospike-chronon-test-tls", "aerospike-chronon-test-tls-mtls")
+  val tlsCertsDir: String          = "docker/tls-certs"
+  val tlsUser: String              = "chronon-user"
+  val tlsPassword: String          = "chronon-pass"
+  /** The client cert CN, provisioned as a `nopassword` PKI user. */
+  val tlsPkiUser: String           = "chronon-client"
+
+  /** Runs `body` against the EE TLS fixtures (`tls` on [[tlsPort]], mTLS
+    * required on [[mtlsPort]]). The suite lifecycle owns setup — `beforeAll`
+    * runs `docker compose --profile tls run --rm tls-ready` once (certificate
+    * init, both servers, user provisioning) and `afterAll` removes the
+    * fixture containers — so tests share the same fixtures instead of paying
+    * the full compose lifecycle per test. Clears cached clients after each
+    * body so a store built under one fixture identity can't leak into the
+    * next test. */
+  def withTlsServers[T](body: => T): T =
+    try body
+    finally AerospikeClientHolder.clear()
 
   /** Runs `body` against the profile-gated `nsup0` server (NSUP_PERIOD=0, port
     * [[nsup0Port]]), removing the container afterwards. Cancels the test when

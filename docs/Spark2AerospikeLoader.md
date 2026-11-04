@@ -85,3 +85,22 @@ CLI entry point: parses args into an `AerospikeConfig`, obtains a `SparkSession`
 
 ### Review
 No significant issues identified.
+
+## TLS/auth flags
+
+The CLI mirrors every `aerospike.tls.*`/auth `userConf` key (mapped 1:1 in
+`userConfFrom`, validated by `AerospikeConfig.fromUserConf`):
+
+`--tls-enabled`, `--tls-name`, `--tls-protocols`, `--tls-ciphers`,
+`--tls-truststore-file`, `--tls-truststore-password-file`,
+`--tls-truststore-type`, `--tls-keystore-file`,
+`--tls-keystore-password-file`, `--tls-keystore-key-password-file`,
+`--tls-keystore-type`, `--tls-for-login-only`, `--aerospike-user`,
+`--aerospike-password-file`, `--aerospike-password-env`, `--auth-mode`.
+
+Keystore/truststore/password file paths, and the environment variable named by
+`--aerospike-password-env`, must resolve on every executor host — the loader
+does not ship keystore or credential material, and `--aerospike-password-env`
+carries only the variable *name*. There is intentionally no inline
+`--aerospike-password` flag (it would appear in process args and the Spark UI).
+`--aerospike-hosts` accepts `host[:tlsName][:port]` seeds.

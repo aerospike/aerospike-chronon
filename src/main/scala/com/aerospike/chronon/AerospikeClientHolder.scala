@@ -17,12 +17,18 @@
 package com.aerospike.chronon
 
 import com.aerospike.client.{AerospikeClient, Host, Info}
-import com.aerospike.client.async.{EventLoops, NioEventLoops, EventPolicy}
-import com.aerospike.client.policy.{BatchPolicy, ClientPolicy, WritePolicy}
+import com.aerospike.client.async.{EventLoops, EventPolicy, NettyEventLoops, NioEventLoops}
+import io.netty.channel.MultiThreadIoEventLoopGroup
+import io.netty.channel.nio.NioIoHandler
+import com.aerospike.client.policy.{AuthMode, BatchPolicy, ClientPolicy, TlsPolicy, WritePolicy}
 
 import org.slf4j.LoggerFactory
 
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{Files, Paths}
+import java.security.KeyStore
 import java.util.concurrent.ConcurrentHashMap
+import javax.net.ssl.{KeyManagerFactory, SSLContext, TrustManagerFactory}
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.JavaConverters._
 import scala.util.Try
@@ -71,12 +77,32 @@ object AerospikeClientHolder {
   /** Cache key covering only the fields that affect client and policy construction.
     * Two configs that differ only in namespace, TTL, key prefix, lookback, or loader
     * timeout share one client and event loops. */
-  private[chronon] def clientCacheKey(config: AerospikeConfig): String =
-    s"${config.hosts.sorted.mkString(",")}:${config.port}:${config.maxConnsPerNode}:${config.minConnsPerNode}:" +
+  private[chronon] def clientCacheKey(config: AerospikeConfig): String = {
+    val seeds = config.hosts.map(s => s"${s.name}:${s.tlsName.getOrElse("")}:${s.port}")
+      .sorted.mkString(",")
+    val tls = config.tls.map { t =>
+      s"tls(${t.tlsName.getOrElse("")}|${t.protocols.getOrElse(Nil).mkString("+")}|" +
+        s"${t.ciphers.getOrElse(Nil).mkString("+")}|${t.truststoreFile.getOrElse("")}:" +
+        s"${t.truststoreType}@${t.truststorePasswordFile.getOrElse("")}|" +
+        s"${t.keystoreFile.getOrElse("")}:${t.keystoreType}" +
+        s"@${t.keystorePasswordFile.getOrElse("")}@${t.keystoreKeyPasswordFile.getOrElse("")}|" +
+        s"${t.forLoginOnly})"
+    }.getOrElse("plain")
+    // Credentials are references, so the key carries the SOURCE (file path or
+    // env var name), never a secret. A different source is a different
+    // credential and must get its own client rather than silently inheriting
+    // one built from another. An env var cannot change within a JVM, so keying
+    // on its name is exact; a file rewritten in place is the one case that
+    // reuses the existing client (restart to rotate).
+    val auth = s"${config.authMode.key}:${config.credentials.map(_.user).getOrElse("")}" +
+      s"@${config.credentials.flatMap(_.passwordFile).getOrElse("")}" +
+      s"@env:${config.credentials.flatMap(_.passwordEnv).getOrElse("")}"
+    s"$seeds:${config.port}:${config.maxConnsPerNode}:${config.minConnsPerNode}:" +
       s"${config.maxCommandsInProcess.getOrElse(0)}:" +
       s"${config.connectTimeoutMillis}:${config.socketTimeoutMillis}:" +
       s"${config.readTotalTimeoutMillis}:${config.statsReadTotalTimeoutMillis}:${config.writeTotalTimeoutMillis}:" +
-      s"${config.maxRetriesRead}:${config.maxRetriesWrite}"
+      s"${config.maxRetriesRead}:${config.maxRetriesWrite}:$tls:$auth"
+  }
 
   /** Test/observability hook: how many real clients have been constructed in
     * this JVM. Asserts the sharing guarantee — N stores → 1 client. */
@@ -114,11 +140,24 @@ object AerospikeClientHolder {
     try {
       val eventPolicy = new EventPolicy()
       eventPolicy.maxCommandsInProcess = perLoop
-      eventLoops = new NioEventLoops(eventPolicy, loopCount)
+      // The direct-NIO loops cannot speak TLS ("TLS not supported in direct
+      // NIO event loops"); TLS configs switch to netty loops. Netty comes from
+      // the host classpath (Spark/Chronon both ship it) — it is not bundled
+      // with the jdk8 client.
+      eventLoops =
+        if (config.tls.isDefined) {
+          try new NettyEventLoops(eventPolicy,
+            new MultiThreadIoEventLoopGroup(loopCount, NioIoHandler.newFactory()))
+          catch {
+            case e: NoClassDefFoundError =>
+              throw new IllegalStateException(
+                "TLS requires netty 4.2+ on the classpath (io.netty), which the " +
+                  "aerospike client does not bundle: " + e.getMessage, e)
+          }
+        } else new NioEventLoops(eventPolicy, loopCount)
       val clientPolicy = clientPolicyFor(config, eventLoops)
 
-      val hosts = config.hosts.map(new Host(_, config.port)).toArray
-      client = new AerospikeClient(clientPolicy, hosts: _*)
+      client = new AerospikeClient(clientPolicy, seedsFor(config): _*)
       constructionCount.incrementAndGet()
       checkNamespacePolicy(config, resolveNamespace(client, config))
     } catch {
@@ -152,8 +191,104 @@ object AerospikeClientHolder {
     clientPolicy.asyncMinConnsPerNode = config.minConnsPerNode
     clientPolicy.minConnsPerNode = 0
     clientPolicy.timeout = config.connectTimeoutMillis
+
+    config.tls.foreach { t =>
+      val tlsPolicy = new TlsPolicy()
+      t.protocols.foreach(p => tlsPolicy.protocols = p.toArray)
+      t.ciphers.foreach(c => tlsPolicy.ciphers = c.toArray)
+      tlsPolicy.forLoginOnly = t.forLoginOnly
+      // Only build an explicit SSLContext when store files are configured;
+      // otherwise the client's null-context default (system truststore) applies.
+      if (t.truststoreFile.isDefined || t.keystoreFile.isDefined) {
+        tlsPolicy.context = buildSslContext(t)
+      }
+      // NOTE: tlsName is applied per-host in seedsFor, not via
+      // clientPolicy.clusterName — setting clusterName also enables
+      // cluster-name validation, which would reject clusters whose
+      // `cluster-name` differs from the TLS name.
+      clientPolicy.tlsPolicy = tlsPolicy
+    }
+    config.authMode match {
+      case AuthModeSetting.External         => clientPolicy.authMode = AuthMode.EXTERNAL
+      case AuthModeSetting.ExternalInsecure => clientPolicy.authMode = AuthMode.EXTERNAL_INSECURE
+      case AuthModeSetting.Pki              => clientPolicy.authMode = AuthMode.PKI
+      case AuthModeSetting.Internal         => ()
+    }
+    config.credentials.foreach { c =>
+      clientPolicy.user = c.user
+      clientPolicy.password = resolvePassword(c)
+    }
     clientPolicy
   }
+
+  /** Resolves a credential reference on the JVM building the client (never at
+    * config parse, which on Spark runs on the driver): the trimmed contents of
+    * the password file, or the named environment variable. A missing or blank
+    * env var fails closed rather than building an unauthenticated client. */
+  private def readFile(key: String, path: String): Array[Byte] =
+    try Files.readAllBytes(Paths.get(path))
+    catch {
+      case e: java.io.IOException =>
+        throw new IllegalStateException(s"Could not read file '$path' configured by '$key': ${e.getMessage}", e)
+    }
+
+  private def openFile(key: String, path: String): java.io.InputStream =
+    try Files.newInputStream(Paths.get(path))
+    catch {
+      case e: java.io.IOException =>
+        throw new IllegalStateException(s"Could not read file '$path' configured by '$key': ${e.getMessage}", e)
+    }
+
+  private[chronon] def resolvePassword(c: Credentials,
+                                       env: String => Option[String] = n => Option(System.getenv(n))): String =
+    c.passwordFile.map(f => new String(readFile(AerospikeConfig.PasswordFileKey, f), UTF_8).trim)
+      .orElse(c.passwordEnv.map { n =>
+        env(n).map(_.trim).filter(_.nonEmpty).getOrElse(throw new IllegalStateException(
+          s"Environment variable '$n' named by '${AerospikeConfig.PasswordEnvKey}' is not set or empty on this host"))
+      }).orNull
+
+  private def readStorePassword(key: String, file: Option[String]): Array[Char] =
+    file.map(f => new String(readFile(key, f), UTF_8).trim.toCharArray)
+      .orNull
+
+  /** Builds an `SSLContext` from the configured truststore and/or keystore.
+    * With only a truststore, default key managers apply; with only a keystore
+    * (unusual), default trust managers apply. */
+  private[chronon] def buildSslContext(t: TlsSettings): SSLContext = {
+    val trustManagers = t.truststoreFile.map { f =>
+      val ks = KeyStore.getInstance(t.truststoreType)
+      val in = openFile(AerospikeConfig.TlsTruststoreFileKey, f)
+      try ks.load(in, readStorePassword(AerospikeConfig.TlsTruststorePasswordFileKey, t.truststorePasswordFile))
+      finally in.close()
+      val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm)
+      tmf.init(ks)
+      tmf.getTrustManagers
+    }.orNull
+    val keyManagers = t.keystoreFile.map { f =>
+      val storePassword = readStorePassword(AerospikeConfig.TlsKeystorePasswordFileKey, t.keystorePasswordFile)
+      val keyPassword = t.keystoreKeyPasswordFile
+        .map(kf => new String(readFile(AerospikeConfig.TlsKeystoreKeyPasswordFileKey, kf), UTF_8).trim.toCharArray)
+        .getOrElse(storePassword)
+      val ks = KeyStore.getInstance(t.keystoreType)
+      val in = openFile(AerospikeConfig.TlsKeystoreFileKey, f)
+      try ks.load(in, storePassword)
+      finally in.close()
+      val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm)
+      kmf.init(ks, keyPassword)
+      kmf.getKeyManagers
+    }.orNull
+    val ctx = SSLContext.getInstance("TLS")
+    ctx.init(keyManagers, trustManagers, null)
+    ctx
+  }
+
+  /** The `Host[]` passed to the client: per-seed `tlsName` wins, the global
+    * `aerospike.tls.name` covers nameless seeds. */
+  private[chronon] def seedsFor(config: AerospikeConfig): Array[Host] =
+    config.hosts.map { s =>
+      val tlsName = s.tlsName.orElse(config.tls.flatMap(_.tlsName)).orNull
+      new Host(s.name, tlsName, s.port)
+    }.toArray
 
   /** Returns the shared client for `config`, building it (with event loops and
     * a shutdown hook) on first use per cache key. Thread-safe and idempotent. */

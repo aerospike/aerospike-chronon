@@ -36,12 +36,16 @@ lazy val root = (project in file("."))
       chrononApi % "provided;test;it",
       chrononOnline % "provided;test;it",
       aerospikeClient,
+      // Compile scope, not provided: the assembly bundles + shades it into a
+      // private namespace, so TLS works even on hosts carrying netty 4.1.
+      // Thin-jar consumers get it as a normal transitive dependency.
       scallop,
       sparkSql % "provided;test;it",
       logback % "test,it",
       slf4j % "provided;test;it",
       scalatest % "test,it"
-    ),
+    ) ++ nettyModules,
+    dependencyOverrides ++= nettyOverrides,
     crossScalaVersions := Seq("2.12.18", "2.13.12"),
     // Online jar loaded by Chronon's Driver: the loader is the entry point,
     // the Scala library and Chronon/Spark/logback come from the host.
@@ -53,10 +57,26 @@ lazy val root = (project in file("."))
     // it is published with a sibling POM instead.
     assembly / assemblyMergeStrategy := {
       case PathList("META-INF", "maven", _*) => MergeStrategy.discard
+      // jar signatures die under shading; native libs for epoll/kqueue are
+      // unused (we build NioIoHandler only)
+      case PathList("META-INF", xs @ _*) if xs.lastOption.exists(_.matches(".*\\.(SF|DSA|RSA)$")) => MergeStrategy.discard
+      // every netty module carries one; keep a single copy
+      case PathList("META-INF", "io.netty.versions.properties") => MergeStrategy.first
+      case "module-info.class" => MergeStrategy.discard
       case x =>
         val oldStrategy = (assembly / assemblyMergeStrategy).value
         oldStrategy(x)
     },
+    // TLS requires netty 4.2 while typical hosts (Spark 3.5, Chronon) carry
+    // 4.1 — same packages can't coexist, so both the client (which references
+    // io.netty by name) and netty itself are relocated into a private
+    // namespace inside the fat jar.
+    assembly / assemblyShadeRules := Seq(
+      ShadeRule.rename(
+        "io.netty.**"              -> "chronon.shaded.io.netty.@1",
+        "com.aerospike.client.**"  -> "chronon.shaded.com.aerospike.client.@1"
+      ).inAll
+    ),
     // sbt does not write pom.properties; the JFrog deploy needs it to place the
     // -sources and -javadoc jars under com/aerospike/<artifactId>/<version>/.
     pomProperties := {
@@ -74,6 +94,11 @@ lazy val root = (project in file("."))
     ),
     Test / fork := true,
     IntegrationTest / fork := true,
+    // env-var credential ITs (AerospikeTlsSpec): the good value must equal
+    // AerospikeDockerSpec.tlsPassword
+    IntegrationTest / envVars ++= Map(
+      "CHRONON_TEST_AS_PW"     -> "chronon-pass",
+      "CHRONON_TEST_AS_PW_BAD" -> "not-the-password"),
     IntegrationTest / javaOptions ++= Seq(
       "--add-opens=java.base/java.lang=ALL-UNNAMED",
       "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",

@@ -22,7 +22,8 @@ class AerospikeConfigSpec extends AnyFlatSpec with Matchers {
       "aerospike.streaming.maxLookbackDays"   -> "7",
       "aerospike.loader.batch.timeout.seconds" -> "120"
     ))
-    conf.hosts shouldBe Seq("a", "b")
+    conf.hosts.map(_.name) shouldBe Seq("a", "b")
+    conf.hosts.map(_.port) shouldBe Seq(3100, 3100)
     conf.port shouldBe 3100
     conf.namespace shouldBe "features"
     conf.batchTtl shouldBe TtlSetting.Seconds(864000)
@@ -675,5 +676,283 @@ class AerospikeConfigSpec extends AnyFlatSpec with Matchers {
       "aerospike.timeout.read.total.millis" -> "1500",
       "aerospike.timeout.stats.read.total.millis" -> "8000"))
     AerospikeClientHolder.clientCacheKey(other) should not be AerospikeClientHolder.clientCacheKey(conf)
+  }
+
+  // --- TLS / auth configuration ---
+
+  private val tlsBase = retentionBase ++ Map(
+    "aerospike.tls.enabled"                -> "true",
+    "aerospike.tls.truststore.file"        -> "/tls/ca.truststore.p12",
+    "aerospike.tls.truststore.password.file" -> "/tls/storepass.txt",
+    "aerospike.tls.truststore.type"        -> "PKCS12")
+
+  "TLS config" should "parse an enabled config with stores, name, protocols and ciphers" in {
+    val conf = AerospikeConfig.fromUserConf(tlsBase ++ Map(
+      "aerospike.tls.name"       -> "aerospike-tls",
+      "aerospike.tls.protocols"  -> "TLSv1.2, TLSv1.3",
+      "aerospike.tls.ciphers"    -> "TLS_AES_256_GCM_SHA384",
+      "aerospike.tls.keystore.file"            -> "/tls/client.keystore.p12",
+      "aerospike.tls.keystore.password.file"   -> "/tls/storepass.txt",
+      "aerospike.tls.keystore.type"            -> "pkcs12"))
+    val t = conf.tls.get
+    t.tlsName shouldBe Some("aerospike-tls")
+    t.protocols shouldBe Some(Seq("TLSv1.2", "TLSv1.3"))
+    t.ciphers shouldBe Some(Seq("TLS_AES_256_GCM_SHA384"))
+    t.truststoreType shouldBe "PKCS12"
+    t.keystoreFile shouldBe Some("/tls/client.keystore.p12")
+    t.keystoreType shouldBe "PKCS12"
+    t.forLoginOnly shouldBe false
+  }
+
+  it should "be absent by default and reject any aerospike.tls.* key without tls.enabled" in {
+    AerospikeConfig.fromUserConf(retentionBase).tls shouldBe None
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.tls.name" -> "aerospike-tls"))).getMessage should include("aerospike.tls.enabled")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase ++ Map(
+      "aerospike.tls.enabled" -> "false",
+      "aerospike.tls.ciphers" -> "X"))).getMessage should include("aerospike.tls.enabled")
+  }
+
+  it should "reject a non-boolean tls.enabled naming the key" in {
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.tls.enabled" -> "yes"))).getMessage should include("aerospike.tls.enabled")
+  }
+
+  it should "reject empty protocol/cipher lists and unknown store types naming the key" in {
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase +
+      ("aerospike.tls.protocols" -> " , ,"))).getMessage should include("aerospike.tls.protocols")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase +
+      ("aerospike.tls.truststore.type" -> "PEM"))).getMessage should include("aerospike.tls.truststore.type")
+  }
+
+  it should "require a keystore password file with the keystore and reject orphaned store password keys" in {
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase +
+      ("aerospike.tls.keystore.file" -> "/tls/client.keystore.p12"))).getMessage should
+      include("aerospike.tls.keystore.password.file")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase +
+      ("aerospike.tls.keystore.password.file" -> "/tls/storepass.txt"))).getMessage should
+      include("aerospike.tls.keystore.file")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase ++ Map(
+      "aerospike.tls.enabled" -> "true",
+      "aerospike.tls.truststore.password.file" -> "/tls/storepass.txt"))).getMessage should
+      include("aerospike.tls.truststore.file")
+  }
+
+  it should "allow tls.enabled with no stores (default JVM SSLContext)" in {
+    val conf = AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.tls.enabled" -> "true") + ("aerospike.tls.name" -> "aerospike-tls"))
+    conf.tls.get.truststoreFile shouldBe None
+  }
+
+  "seed hosts" should "parse host[:tlsName][:port] and fill the default port" in {
+    val conf = AerospikeConfig.fromUserConf(tlsBase ++ Map(
+      "aerospike.hosts" -> "node1:aerospike-tls:4333,node2,node3:4334"))
+    conf.hosts.map(h => (h.name, h.tlsName, h.port)) shouldBe Seq(
+      ("node1", Some("aerospike-tls"), 4333),
+      ("node2", None, 3000),
+      ("node3", None, 4334))
+  }
+
+  it should "reject a tlsName seed while TLS is disabled" in {
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.hosts" -> "node1:aerospike-tls:4333"))).getMessage should include("aerospike.hosts")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.hosts" -> "node1:aerospike-tls"))).getMessage should include("aerospike.hosts")
+  }
+
+  "auth config" should "default to internal, pair-validate credentials and accept a password file or env var" in {
+    val conf = AerospikeConfig.fromUserConf(retentionBase)
+    conf.authMode shouldBe AuthModeSetting.Internal
+    conf.credentials shouldBe None
+
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.user" -> "u"))).getMessage should include("aerospike.user")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.password.env" -> "PW"))).getMessage should include("aerospike.user")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase ++ Map(
+      "aerospike.user" -> "u", "aerospike.password.env" -> "PW",
+      "aerospike.password.file" -> "/pw"))).getMessage should include("mutually exclusive")
+
+    val c = AerospikeConfig.fromUserConf(retentionBase ++ Map(
+      "aerospike.user" -> "u", "aerospike.password.file" -> "/pw"))
+    c.credentials shouldBe Some(Credentials("u", Some("/pw"), None))
+    val e = AerospikeConfig.fromUserConf(retentionBase ++ Map(
+      "aerospike.user" -> "u", "aerospike.password.env" -> " AS_PW "))
+    e.credentials shouldBe Some(Credentials("u", None, Some("AS_PW")))
+  }
+
+  it should "reject the removed inline aerospike.password key instead of silently ignoring it" in {
+    val ex = intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase ++ Map(
+      "aerospike.user" -> "u", "aerospike.password" -> "p")))
+    ex.getMessage should include("aerospike.password")
+    ex.getMessage should include("aerospike.password.file")
+    ex.getMessage should include("aerospike.password.env")
+    ex.getMessage should not include "\"p\""
+  }
+
+  it should "reject unknown auth.mode naming the key and value" in {
+    val ex = intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.auth.mode" -> "kerberos")))
+    ex.getMessage should include("aerospike.auth.mode")
+    ex.getMessage should include("kerberos")
+  }
+
+  it should "enforce the per-mode TLS and credential rules" in {
+    // pki needs TLS + keystore, forbids credentials
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.auth.mode" -> "pki"))).getMessage should include("aerospike.auth.mode")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase +
+      ("aerospike.auth.mode" -> "pki"))).getMessage should include("aerospike.tls.keystore.file")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase ++ Map(
+      "aerospike.auth.mode" -> "pki",
+      "aerospike.tls.keystore.file" -> "/tls/client.keystore.p12",
+      "aerospike.tls.keystore.password.file" -> "/tls/storepass.txt",
+      "aerospike.user" -> "u", "aerospike.password.env" -> "PW"))).getMessage should
+      include("aerospike.auth.mode")
+    val pki = AerospikeConfig.fromUserConf(tlsBase ++ Map(
+      "aerospike.auth.mode" -> "pki",
+      "aerospike.tls.keystore.file" -> "/tls/client.keystore.p12",
+      "aerospike.tls.keystore.password.file" -> "/tls/storepass.txt"))
+    pki.authMode shouldBe AuthModeSetting.Pki
+
+    // external needs TLS + credentials; external_insecure needs credentials only
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase ++ Map(
+      "aerospike.auth.mode" -> "external",
+      "aerospike.user" -> "u", "aerospike.password.env" -> "PW"))).getMessage should
+      include("aerospike.tls.enabled")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase +
+      ("aerospike.auth.mode" -> "external"))).getMessage should include("aerospike.user")
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(retentionBase +
+      ("aerospike.auth.mode" -> "external_insecure"))).getMessage should include("aerospike.user")
+  }
+
+  "forLoginOnly" should "require credentials" in {
+    intercept[IllegalArgumentException](AerospikeConfig.fromUserConf(tlsBase +
+      ("aerospike.tls.forLoginOnly" -> "true"))).getMessage should
+      include("aerospike.tls.forLoginOnly")
+    val conf = AerospikeConfig.fromUserConf(tlsBase ++ Map(
+      "aerospike.tls.forLoginOnly" -> "true",
+      "aerospike.user" -> "u", "aerospike.password.file" -> "/pw"))
+    conf.tls.get.forLoginOnly shouldBe true
+  }
+
+  "clientCacheKey" should "change on any TLS or auth identity difference, including the password source" in {
+    val plain = AerospikeConfig.fromUserConf(retentionBase)
+    val tlsConf = AerospikeConfig.fromUserConf(tlsBase)
+    val key = AerospikeClientHolder.clientCacheKey _
+    key(tlsConf) should not be key(plain)
+    for (extra <- Seq(
+        Map("aerospike.tls.name" -> "other"),
+        Map("aerospike.tls.ciphers" -> "X"),
+        Map("aerospike.tls.truststore.file" -> "/other.p12"),
+        Map("aerospike.hosts" -> "localhost:aerospike-tls:4333"),
+        Map("aerospike.user" -> "u", "aerospike.password.env" -> "PW"),
+        Map("aerospike.auth.mode" -> "pki",
+            "aerospike.tls.keystore.file" -> "/k.p12",
+            "aerospike.tls.keystore.password.file" -> "/pw"))) {
+      key(AerospikeConfig.fromUserConf(tlsBase ++ extra)) should not be key(tlsConf)
+    }
+    // credentials are references: a different file path or env var NAME is a
+    // different credential and gets its own client; the same source is shared
+    def withPw(kv: (String, String)) =
+      AerospikeConfig.fromUserConf(tlsBase ++ Map("aerospike.user" -> "u") + kv)
+    key(withPw("aerospike.password.env" -> "PW_A")) shouldBe key(withPw("aerospike.password.env" -> "PW_A"))
+    key(withPw("aerospike.password.env" -> "PW_A")) should not be key(withPw("aerospike.password.env" -> "PW_B"))
+    key(withPw("aerospike.password.file" -> "/pw")) should not be key(withPw("aerospike.password.file" -> "/other-pw"))
+    key(withPw("aerospike.password.file" -> "/pw")) should not be key(withPw("aerospike.password.env" -> "/pw"))
+    // different user is a different client
+    val v = AerospikeConfig.fromUserConf(tlsBase ++ Map(
+      "aerospike.user" -> "v", "aerospike.password.env" -> "PW_A"))
+    key(withPw("aerospike.password.env" -> "PW_A")) should not be key(v)
+    // keystore/truststore password-file paths are identity too
+    key(AerospikeConfig.fromUserConf(tlsBase ++ Map("aerospike.tls.truststore.file" -> "/t.p12",
+      "aerospike.tls.truststore.password.file" -> "/a"))) should not be
+      key(AerospikeConfig.fromUserConf(tlsBase ++ Map("aerospike.tls.truststore.file" -> "/t.p12",
+        "aerospike.tls.truststore.password.file" -> "/b")))
+  }
+
+  "AerospikeConfig.forLoader" should "carry TLS and auth fields unchanged" in {
+    val conf = AerospikeConfig.fromUserConf(tlsBase ++ Map(
+      "aerospike.user" -> "u", "aerospike.password.file" -> "/pw"))
+    val l = AerospikeConfig.forLoader(conf)
+    l.tls shouldBe conf.tls
+    l.authMode shouldBe conf.authMode
+    l.credentials shouldBe conf.credentials
+  }
+
+  /** A temp dir of loadable throwaway PKCS12 stores + a password file. The
+    * wiring under test only requires the stores to load — real cert material
+    * (and PKI auth) is exercised by the src/it TLS fixture, not here. */
+  private def fixtureStoresDir(): String = {
+    val dir = java.nio.file.Files.createTempDirectory("chronon-tls-stores")
+    val pw = "storepass".toCharArray
+    Seq("ca.truststore.p12", "client.keystore.p12").foreach { name =>
+      val ks = java.security.KeyStore.getInstance("PKCS12")
+      ks.load(null, pw)
+      val out = java.nio.file.Files.newOutputStream(dir.resolve(name))
+      try ks.store(out, pw) finally out.close()
+    }
+    java.nio.file.Files.write(dir.resolve("storepass.txt"),
+      "storepass".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    dir.toString
+  }
+
+  "clientPolicyFor" should "wire tlsPolicy, clusterName, authMode and credentials" in {
+    val certs = fixtureStoresDir()
+    val realStores = retentionBase ++ Map(
+      "aerospike.tls.enabled" -> "true",
+      "aerospike.tls.truststore.file" -> s"$certs/ca.truststore.p12",
+      "aerospike.tls.truststore.password.file" -> s"$certs/storepass.txt",
+      "aerospike.tls.truststore.type" -> "PKCS12")
+    val conf = AerospikeConfig.fromUserConf(realStores ++ Map(
+      "aerospike.tls.name" -> "aerospike-tls",
+      "aerospike.tls.protocols" -> "TLSv1.2,TLSv1.3",
+      "aerospike.user" -> "u", "aerospike.password.file" -> s"$certs/storepass.txt"))
+    val p = AerospikeClientHolder.clientPolicyFor(conf, null)
+    p.tlsPolicy should not be null
+    p.tlsPolicy.context should not be null // truststore configured -> explicit context
+    p.tlsPolicy.protocols shouldBe Array("TLSv1.2", "TLSv1.3")
+    p.tlsPolicy.forLoginOnly shouldBe false
+    // clusterName stays unset — it would enable cluster-name validation;
+    // the global TLS name lands on the seeds instead
+    p.clusterName shouldBe null
+    AerospikeClientHolder.seedsFor(conf).map(h => h.tlsName) shouldBe Seq("aerospike-tls")
+    p.user shouldBe "u"
+    p.password shouldBe "storepass" // read from the password file at build
+    p.authMode shouldBe com.aerospike.client.policy.AuthMode.INTERNAL
+
+    val noStore = AerospikeClientHolder.clientPolicyFor(
+      AerospikeConfig.fromUserConf(retentionBase + ("aerospike.tls.enabled" -> "true")), null)
+    noStore.tlsPolicy.context shouldBe null // default JVM SSLContext
+
+    val pki = AerospikeClientHolder.clientPolicyFor(AerospikeConfig.fromUserConf(realStores ++ Map(
+      "aerospike.auth.mode" -> "pki",
+      "aerospike.tls.keystore.file" -> s"$certs/client.keystore.p12",
+      "aerospike.tls.keystore.password.file" -> s"$certs/storepass.txt",
+      "aerospike.tls.keystore.type" -> "PKCS12")), null)
+    pki.authMode shouldBe com.aerospike.client.policy.AuthMode.PKI
+    pki.user shouldBe null
+  }
+
+  "resolvePassword" should "read the env var named by the config, failing closed when unset or blank" in {
+    val c = Credentials("u", None, Some("AS_PW"))
+    AerospikeClientHolder.resolvePassword(c, Map("AS_PW" -> "  s3cret \n").get) shouldBe "s3cret"
+    val unset = intercept[IllegalStateException](AerospikeClientHolder.resolvePassword(c, _ => None))
+    unset.getMessage should include("AS_PW")
+    intercept[IllegalStateException](AerospikeClientHolder.resolvePassword(c, Map("AS_PW" -> "  ").get))
+  }
+
+  it should "prefer neither source silently: a file reference reads the file, not the env" in {
+    val pw = java.nio.file.Files.createTempFile("pw", ".txt")
+    pw.toFile.deleteOnExit()
+    java.nio.file.Files.write(pw, "from-file\n".getBytes("UTF-8"))
+    AerospikeClientHolder.resolvePassword(Credentials("u", Some(pw.toString), None), _ => Some("from-env")) shouldBe "from-file"
+  }
+
+  it should "name the config key and path when the password file is unreadable" in {
+    val ex = intercept[IllegalStateException](
+      AerospikeClientHolder.resolvePassword(Credentials("u", Some("/no/such/pw.txt"), None), _ => None))
+    ex.getMessage should include("aerospike.password.file")
+    ex.getMessage should include("/no/such/pw.txt")
   }
 }

@@ -16,6 +16,8 @@
 
 package com.aerospike.chronon
 
+import com.aerospike.client.Host
+
 /** A record TTL mode: positive seconds, never expire (`expiration = -1`) or
   * defer to the namespace default (`expiration = 0`). */
 sealed trait TtlSetting {
@@ -36,6 +38,53 @@ object TtlSetting {
   case object NamespaceDefault extends TtlSetting { def expiration: Int = 0 }
 }
 
+/** How the client authenticates with the cluster. `Pki` uses the client
+  * certificate (the cert CN is the user) and forbids user/password;
+  * `External` sends the password over TLS to a server-side directory;
+  * `ExternalInsecure` sends it without TLS (testing only). */
+sealed trait AuthModeSetting { def key: String }
+
+object AuthModeSetting {
+  case object Internal         extends AuthModeSetting { val key = "internal" }
+  case object External         extends AuthModeSetting { val key = "external" }
+  case object ExternalInsecure extends AuthModeSetting { val key = "external_insecure" }
+  case object Pki              extends AuthModeSetting { val key = "pki" }
+
+  val all: Seq[AuthModeSetting] = Seq(Internal, External, ExternalInsecure, Pki)
+
+  def parse(configKey: String, value: String): AuthModeSetting =
+    all.find(_.key == value.trim.toLowerCase).getOrElse(
+      throw new IllegalArgumentException(
+        s"Config key '$configKey' must be one of ${all.map(_.key).mkString("|")}, got: '$value'"))
+}
+
+/** TLS material for the client, present only when `aerospike.tls.enabled=true`.
+  * Keystore/truststore files are JKS or PKCS12; store passwords come from
+  * *files* so secrets stay out of `userConf`. */
+final case class TlsSettings(tlsName: Option[String],
+                             protocols: Option[Seq[String]],
+                             ciphers: Option[Seq[String]],
+                             truststoreFile: Option[String],
+                             truststorePasswordFile: Option[String],
+                             truststoreType: String,
+                             keystoreFile: Option[String],
+                             keystorePasswordFile: Option[String],
+                             keystoreKeyPasswordFile: Option[String],
+                             keystoreType: String,
+                             forLoginOnly: Boolean)
+
+/** Credentials as a *reference*, never a value: exactly one of a password
+  * file or the name of an environment variable, resolved at client build on
+  * the JVM that builds the client (so on a Spark executor it is the
+  * executor's file/env, and no secret travels in the serialised config or
+  * task closure). */
+final case class Credentials(user: String, passwordFile: Option[String], passwordEnv: Option[String])
+
+/** A parsed `host[:tlsName][:port]` seed. Kept as a plain case class (not
+  * `com.aerospike.client.Host`) because the config is serialized to Spark
+  * executors and `Host` is not `Serializable`. */
+final case class Seed(name: String, tlsName: Option[String], port: Int)
+
 /** Parsed and validated connection/tuning settings for the store, built by
   * [[AerospikeConfig.fromUserConf]] from Chronon's `userConf` map.
   *
@@ -44,8 +93,10 @@ object TtlSetting {
   * `AerospikeClientHolder`'s cache key; namespace, TTL, key prefix, lookback,
   * and loader timeout are per-store and never create a second client.
   *
-  * @param hosts                     cluster seed hosts (required, non-empty)
-  * @param port                      service port (default 3000)
+  * @param hosts                     cluster seeds (required, non-empty); each
+  *                                  `userConf` entry is `host[:tlsName][:port]`
+  *                                  with `port` filling seeds that omit one
+  * @param port                      default service port (default 3000)
   * @param namespace                 target namespace (required)
   * @param batchTtl                  TTL for batch records (default 5 days): a
   *                                  positive number of seconds, `0` = never expire
@@ -101,7 +152,7 @@ object TtlSetting {
   * @param readBatchChunkSize        maximum `BatchRead`s per `multiGet` batch call; larger
   *                                  reads are split into chunks issued concurrently (default 1000)
   */
-final case class AerospikeConfig(hosts: Seq[String],
+final case class AerospikeConfig(hosts: Seq[Seed],
                                  port: Int,
                                  namespace: String,
                                  batchTtl: TtlSetting,
@@ -125,7 +176,10 @@ final case class AerospikeConfig(hosts: Seq[String],
                                  readBatchChunkSize: Int = AerospikeConfig.DefaultReadBatchChunkSize,
                                  loaderMaxConnsPerNode: Int = AerospikeConfig.DefaultLoaderMaxConnsPerNode,
                                  loaderMinConnsPerNode: Int = AerospikeConfig.DefaultLoaderMinConnsPerNode,
-                                 statsReadTotalTimeoutMillis: Int = AerospikeConfig.DefaultStatsReadTotalTimeoutMs) {
+                                 statsReadTotalTimeoutMillis: Int = AerospikeConfig.DefaultStatsReadTotalTimeoutMs,
+                                 tls: Option[TlsSettings] = None,
+                                 authMode: AuthModeSetting = AuthModeSetting.Internal,
+                                 credentials: Option[Credentials] = None) {
 
   // A stalled attempt consumes socketTimeout; when it is not below the class
   // total there is no time left for a retry, so retries could never fire.
@@ -210,6 +264,55 @@ object AerospikeConfig {
     * segment reads alike). Default [[DefaultReadBatchChunkSize]]. */
   val ReadBatchChunkSizeKey       = "aerospike.read.batchChunkSize"
 
+  /** Enable TLS on all connections. Required before any `aerospike.tls.*` key
+    * is accepted — a stray TLS key must never silently flip the wire. */
+  val TlsEnabledKey               = "aerospike.tls.enabled"
+  /** Cluster-wide TLS name applied to seeds that carry no `host:tlsName[:port]`
+    * name of their own (the seed-level name always wins). */
+  val TlsNameKey                  = "aerospike.tls.name"
+  /** Comma-separated TLS protocol allowlist (client default: TLSv1.2). */
+  val TlsProtocolsKey             = "aerospike.tls.protocols"
+  /** Comma-separated cipher allowlist (client default: JVM ciphers). */
+  val TlsCiphersKey               = "aerospike.tls.ciphers"
+  /** JKS/PKCS12 truststore file with the CA certificate(s). Absent = default
+    * JVM `SSLContext` (system truststore / `-Djavax.net.ssl.trustStore`). */
+  val TlsTruststoreFileKey        = "aerospike.tls.truststore.file"
+  /** File containing the truststore password. */
+  val TlsTruststorePasswordFileKey = "aerospike.tls.truststore.password.file"
+  /** `JKS` or `PKCS12`. Default `JKS`. */
+  val TlsTruststoreTypeKey        = "aerospike.tls.truststore.type"
+  /** JKS/PKCS12 keystore with the client certificate chain + key (mTLS, PKI). */
+  val TlsKeystoreFileKey          = "aerospike.tls.keystore.file"
+  /** File containing the keystore password. */
+  val TlsKeystorePasswordFileKey  = "aerospike.tls.keystore.password.file"
+  /** File containing the key password; falls back to the keystore password. */
+  val TlsKeystoreKeyPasswordFileKey = "aerospike.tls.keystore.key.password.file"
+  /** `JKS` or `PKCS12`. Default `JKS`. */
+  val TlsKeystoreTypeKey          = "aerospike.tls.keystore.type"
+  /** TLS for login only: credentials over TLS, then cleartext data plane.
+    * Requires credentials; NOT transport encryption. */
+  val TlsForLoginOnlyKey          = "aerospike.tls.forLoginOnly"
+  /** `internal` (default) | `external` | `external_insecure` | `pki`. */
+  val AuthModeKey                 = "aerospike.auth.mode"
+  /** Authentication user (internal/external modes; also asinfo users). */
+  val UserKey                     = "aerospike.user"
+  /** Removed: inline passwords were serialised into Spark task closures and
+    * visible wherever `userConf` is logged. Setting it fails at parse. */
+  val RemovedPasswordKey          = "aerospike.password"
+  /** File containing the password, read on the JVM that builds the client. */
+  val PasswordFileKey             = "aerospike.password.file"
+  /** NAME of an environment variable holding the password, read on the JVM
+    * that builds the client (a Spark executor needs it in its own env). */
+  val PasswordEnvKey              = "aerospike.password.env"
+
+  private val TlsKeys = Set(
+    TlsNameKey, TlsProtocolsKey, TlsCiphersKey,
+    TlsTruststoreFileKey, TlsTruststorePasswordFileKey, TlsTruststoreTypeKey,
+    TlsKeystoreFileKey, TlsKeystorePasswordFileKey, TlsKeystoreKeyPasswordFileKey,
+    TlsKeystoreTypeKey, TlsForLoginOnlyKey)
+
+  private val StoreTypes = Set("JKS", "PKCS12")
+
   val DefaultPort                       = 3000
   val DefaultTtlSeconds: Long           = 5L * 24 * 3600 // 5 days
   val DefaultMaxConnsPerNode            = 100
@@ -265,8 +368,7 @@ object AerospikeConfig {
   def fromUserConf(userConf: Map[String, String]): AerospikeConfig = {
     val rawHosts = userConf.getOrElse(HostsKey, throw new IllegalArgumentException(
       s"Missing required config key: $HostsKey (e.g. 'localhost' or 'host1,host2')"))
-    val hosts = rawHosts.split(',').map(_.trim).filter(_.nonEmpty).toSeq
-    if (hosts.isEmpty) {
+    if (rawHosts.split(',').map(_.trim).forall(_.isEmpty)) {
       throw new IllegalArgumentException(
         s"Config key '$HostsKey' must contain at least one non-empty host, got: '$rawHosts'")
     }
@@ -315,6 +417,142 @@ object AerospikeConfig {
 
     val namespace = userConf.getOrElse(NamespaceKey, throw new IllegalArgumentException(
       s"Missing required config key: $NamespaceKey"))
+
+    def parseBoolean(key: String): Option[Boolean] =
+      userConf.get(key).map { v =>
+        v.trim.toLowerCase match {
+          case "true"  => true
+          case "false" => false
+          case _ => throw new IllegalArgumentException(
+            s"Config key '$key' must be 'true' or 'false', got: '$v'")
+        }
+      }
+
+    def parseCsv(key: String): Option[Seq[String]] =
+      userConf.get(key).map { v =>
+        val items = v.split(',').map(_.trim).filter(_.nonEmpty)
+        if (items.isEmpty) {
+          throw new IllegalArgumentException(s"Config key '$key' must list at least one value, got: '$v'")
+        }
+        items.toSeq
+      }
+
+    def storeType(key: String, default: String = "JKS"): String =
+      userConf.get(key).map(_.trim.toUpperCase) match {
+        case Some(t) if StoreTypes.contains(t) => t
+        case Some(t) => throw new IllegalArgumentException(
+          s"Config key '$key' must be ${StoreTypes.mkString(" or ")}, got: '$t'")
+        case None => default
+      }
+
+    val port = parsePositiveInt(PortKey, DefaultPort)
+
+    // Seeds use the client's native host[:tlsName][:port] syntax; `port` fills
+    // entries that omit it.
+    val hosts: Seq[Seed] =
+      try {
+        Host.parseHosts(
+          rawHosts.split(',').map(_.trim).filter(_.nonEmpty).mkString(","), port)
+          .map(h => Seed(h.name, Option(h.tlsName), h.port)).toSeq
+      } catch {
+        case e: Exception =>
+          throw new IllegalArgumentException(
+            s"Config key '$HostsKey' has an invalid seed ('$rawHosts'): ${e.getMessage}")
+      }
+
+    val tlsEnabled = parseBoolean(TlsEnabledKey).getOrElse(false)
+    val tlsKeysSet = TlsKeys.filter(userConf.contains)
+    if (!tlsEnabled && tlsKeysSet.nonEmpty) {
+      throw new IllegalArgumentException(
+        s"TLS keys ${tlsKeysSet.toSeq.sorted.mkString(", ")} require '$TlsEnabledKey'='true'")
+    }
+    val tls: Option[TlsSettings] =
+      if (!tlsEnabled) None
+      else Some(TlsSettings(
+        tlsName = userConf.get(TlsNameKey).map(_.trim).filter(_.nonEmpty),
+        protocols = parseCsv(TlsProtocolsKey),
+        ciphers = parseCsv(TlsCiphersKey),
+        truststoreFile = userConf.get(TlsTruststoreFileKey).map(_.trim).filter(_.nonEmpty),
+        truststorePasswordFile = userConf.get(TlsTruststorePasswordFileKey).map(_.trim).filter(_.nonEmpty),
+        truststoreType = storeType(TlsTruststoreTypeKey),
+        keystoreFile = userConf.get(TlsKeystoreFileKey).map(_.trim).filter(_.nonEmpty),
+        keystorePasswordFile = userConf.get(TlsKeystorePasswordFileKey).map(_.trim).filter(_.nonEmpty),
+        keystoreKeyPasswordFile = userConf.get(TlsKeystoreKeyPasswordFileKey).map(_.trim).filter(_.nonEmpty),
+        keystoreType = storeType(TlsKeystoreTypeKey),
+        forLoginOnly = parseBoolean(TlsForLoginOnlyKey).getOrElse(false)))
+
+    tls.foreach { t =>
+      if (t.keystoreFile.isDefined && t.keystorePasswordFile.isEmpty) {
+        throw new IllegalArgumentException(
+          s"Config key '$TlsKeystoreFileKey' requires '$TlsKeystorePasswordFileKey'")
+      }
+      if (t.keystoreFile.isEmpty &&
+          (t.keystorePasswordFile.isDefined || t.keystoreKeyPasswordFile.isDefined)) {
+        throw new IllegalArgumentException(
+          s"Keystore password keys require '$TlsKeystoreFileKey'")
+      }
+      if (t.truststoreFile.isEmpty && t.truststorePasswordFile.isDefined) {
+        throw new IllegalArgumentException(
+          s"Config key '$TlsTruststorePasswordFileKey' requires '$TlsTruststoreFileKey'")
+      }
+    }
+    if (!tlsEnabled && hosts.exists(_.tlsName.isDefined)) {
+      throw new IllegalArgumentException(
+        s"Config key '$HostsKey' carries a per-seed TLS name but '$TlsEnabledKey' is not 'true'")
+    }
+
+    val authMode = userConf.get(AuthModeKey).map(AuthModeSetting.parse(AuthModeKey, _))
+      .getOrElse(AuthModeSetting.Internal)
+    val user = userConf.get(UserKey).map(_.trim).filter(_.nonEmpty)
+    if (userConf.contains(RemovedPasswordKey)) {
+      throw new IllegalArgumentException(
+        s"Config key '$RemovedPasswordKey' is no longer supported (inline passwords are " +
+          s"serialised to executors and visible in logs); use '$PasswordFileKey' or '$PasswordEnvKey'")
+    }
+    val passwordFile = userConf.get(PasswordFileKey).map(_.trim).filter(_.nonEmpty)
+    val passwordEnv = userConf.get(PasswordEnvKey).map(_.trim).filter(_.nonEmpty)
+    if (passwordFile.isDefined && passwordEnv.isDefined) {
+      throw new IllegalArgumentException(
+        s"Config keys '$PasswordFileKey' and '$PasswordEnvKey' are mutually exclusive")
+    }
+    if (user.isDefined != (passwordFile.isDefined || passwordEnv.isDefined)) {
+      throw new IllegalArgumentException(
+        s"Config keys '$UserKey' and '$PasswordFileKey'/'$PasswordEnvKey' must be set together")
+    }
+    val credentials = user.map(u => Credentials(u, passwordFile, passwordEnv))
+
+    authMode match {
+      case AuthModeSetting.Pki =>
+        if (tls.isEmpty || tls.get.keystoreFile.isEmpty) {
+          throw new IllegalArgumentException(
+            s"Config key '$AuthModeKey'='pki' requires '$TlsEnabledKey' and '$TlsKeystoreFileKey'")
+        }
+        if (credentials.isDefined) {
+          throw new IllegalArgumentException(
+            s"Config key '$AuthModeKey'='pki' authenticates by certificate; " +
+              s"'$UserKey'/'$PasswordFileKey'/'$PasswordEnvKey' must not be set")
+        }
+      case AuthModeSetting.External =>
+        if (tls.isEmpty) {
+          throw new IllegalArgumentException(
+            s"Config key '$AuthModeKey'='external' requires '$TlsEnabledKey'")
+        }
+        if (credentials.isEmpty) {
+          throw new IllegalArgumentException(
+            s"Config key '$AuthModeKey'='external' requires '$UserKey' and a password")
+        }
+      case AuthModeSetting.ExternalInsecure =>
+        if (credentials.isEmpty) {
+          throw new IllegalArgumentException(
+            s"Config key '$AuthModeKey'='external_insecure' requires '$UserKey' and a password")
+        }
+      case AuthModeSetting.Internal => ()
+    }
+    if (tls.exists(_.forLoginOnly) && credentials.isEmpty) {
+      throw new IllegalArgumentException(
+        s"Config key '$TlsForLoginOnlyKey' requires '$UserKey' and a password " +
+          "(login-only TLS only protects the credential exchange)")
+    }
 
     def parseTtl(key: String): Option[TtlSetting] =
       userConf.get(key).map { v =>
@@ -387,7 +625,7 @@ object AerospikeConfig {
 
     AerospikeConfig(
       hosts = hosts,
-      port = parsePositiveInt(PortKey, DefaultPort),
+      port = port,
       namespace = namespace,
       batchTtl = batchTtl,
       streamingTtl = streamingTtl,
@@ -410,7 +648,10 @@ object AerospikeConfig {
       maxSegmentsPerDay = parsePositiveInt(MaxSegmentsPerDayKey, DefaultMaxSegmentsPerDay),
       readBatchChunkSize = parsePositiveInt(ReadBatchChunkSizeKey, DefaultReadBatchChunkSize),
       loaderMaxConnsPerNode = loaderMaxConnsPerNode,
-      loaderMinConnsPerNode = loaderMinConnsPerNode
+      loaderMinConnsPerNode = loaderMinConnsPerNode,
+      tls = tls,
+      authMode = authMode,
+      credentials = credentials
     )
   }
 

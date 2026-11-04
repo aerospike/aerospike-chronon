@@ -310,7 +310,28 @@ object Spark2AerospikeLoader {
       AerospikeConfig.LoaderBatchTimeoutSecondsKey   -> conf.batchTimeoutSeconds.getOrElse(AerospikeConfig.DefaultLoaderBatchTimeoutSeconds.toString)
     )
     val withPrefix = conf.keyPrefix.toOption.fold(baseConf)(p => baseConf + (AerospikeConfig.KeyPrefixKey -> p))
-    conf.maxCommandsInProcess.toOption.fold(withPrefix)(v => withPrefix + (AerospikeConfig.MaxCommandsInProcessKey -> v))
+    val withInflight = conf.maxCommandsInProcess.toOption.fold(withPrefix)(v => withPrefix + (AerospikeConfig.MaxCommandsInProcessKey -> v))
+    // TLS/auth flags map 1:1 onto their userConf keys; unset flags omit the key.
+    val flagKeys: Seq[(org.rogach.scallop.ScallopOption[String], String)] = Seq(
+      conf.tlsEnabled               -> AerospikeConfig.TlsEnabledKey,
+      conf.tlsName                  -> AerospikeConfig.TlsNameKey,
+      conf.tlsProtocols             -> AerospikeConfig.TlsProtocolsKey,
+      conf.tlsCiphers               -> AerospikeConfig.TlsCiphersKey,
+      conf.tlsTruststoreFile        -> AerospikeConfig.TlsTruststoreFileKey,
+      conf.tlsTruststorePasswordFile -> AerospikeConfig.TlsTruststorePasswordFileKey,
+      conf.tlsTruststoreType        -> AerospikeConfig.TlsTruststoreTypeKey,
+      conf.tlsKeystoreFile          -> AerospikeConfig.TlsKeystoreFileKey,
+      conf.tlsKeystorePasswordFile  -> AerospikeConfig.TlsKeystorePasswordFileKey,
+      conf.tlsKeystoreKeyPasswordFile -> AerospikeConfig.TlsKeystoreKeyPasswordFileKey,
+      conf.tlsKeystoreType          -> AerospikeConfig.TlsKeystoreTypeKey,
+      conf.tlsForLoginOnly          -> AerospikeConfig.TlsForLoginOnlyKey,
+      conf.aerospikeUser            -> AerospikeConfig.UserKey,
+      conf.aerospikePasswordEnv     -> AerospikeConfig.PasswordEnvKey,
+      conf.aerospikePasswordFile    -> AerospikeConfig.PasswordFileKey,
+      conf.authMode                 -> AerospikeConfig.AuthModeKey)
+    flagKeys.foldLeft(withInflight) { case (m, (opt, key)) =>
+      opt.toOption.fold(m)(v => m + (key -> v))
+    }
   }
 
   private class LoaderConf(args: Seq[String]) extends ScallopConf(args) {
@@ -334,6 +355,24 @@ object Spark2AerospikeLoader {
     val keyPrefix = opt[String](name = "key-prefix", descr = "Optional prefix prepended to all record keys")
     val maxLookbackDays = opt[String](name = "max-lookback-days", descr = "Streaming read max lookback in days (default: 0 — the loader writes batch data only)")
     val batchTimeoutSeconds = opt[String](name = "batch-timeout-seconds", descr = "Timeout per multiPut batch in seconds", default = Some(AerospikeConfig.DefaultLoaderBatchTimeoutSeconds.toString))
+    // TLS/auth mirror the aerospike.* userConf keys; store files must resolve
+    // on every executor host.
+    val tlsEnabled = opt[String](name = "tls-enabled", descr = "Enable TLS on all Aerospike connections (true/false)")
+    val tlsName = opt[String](name = "tls-name", descr = "Cluster TLS name; seed 'host:tlsName[:port]' overrides")
+    val tlsProtocols = opt[String](name = "tls-protocols", descr = "Comma-separated TLS protocol allowlist")
+    val tlsCiphers = opt[String](name = "tls-ciphers", descr = "Comma-separated TLS cipher allowlist")
+    val tlsTruststoreFile = opt[String](name = "tls-truststore-file", descr = "JKS/PKCS12 truststore with the CA cert (default: JVM truststore)")
+    val tlsTruststorePasswordFile = opt[String](name = "tls-truststore-password-file", descr = "File containing the truststore password")
+    val tlsTruststoreType = opt[String](name = "tls-truststore-type", descr = "JKS or PKCS12 (default JKS)")
+    val tlsKeystoreFile = opt[String](name = "tls-keystore-file", descr = "JKS/PKCS12 keystore with client cert chain + key (mTLS/PKI)")
+    val tlsKeystorePasswordFile = opt[String](name = "tls-keystore-password-file", descr = "File containing the keystore password")
+    val tlsKeystoreKeyPasswordFile = opt[String](name = "tls-keystore-key-password-file", descr = "File containing the key password (default: keystore password)")
+    val tlsKeystoreType = opt[String](name = "tls-keystore-type", descr = "JKS or PKCS12 (default JKS)")
+    val tlsForLoginOnly = opt[String](name = "tls-for-login-only", descr = "TLS for login only — cleartext data plane (true/false)")
+    val aerospikeUser = opt[String](name = "aerospike-user", descr = "Aerospike user")
+    val aerospikePasswordEnv = opt[String](name = "aerospike-password-env", descr = "NAME of the environment variable holding the Aerospike password, read on each executor")
+    val aerospikePasswordFile = opt[String](name = "aerospike-password-file", descr = "File containing the Aerospike password, read on each executor")
+    val authMode = opt[String](name = "auth-mode", descr = "internal|external|external_insecure|pki (default internal)")
     verify()
   }
 }

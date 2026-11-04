@@ -539,6 +539,12 @@ Requires JDK 17+ (the `ai.chronon` jars are compiled for Java 17) — run sbt wi
   Requires a running Docker daemon. Connection details can be overridden
   with `AEROSPIKE_HOST` / `AEROSPIKE_PORT` (defaults `localhost:3000`, namespace
   `test` with `nsup-period=2` for TTL coverage).
+- `sbt "it:testOnly *AerospikeTlsSpec"` — TLS/auth tests against opt-in
+  Enterprise Edition fixtures. One command generates certificates + Java
+  stores, starts both EE servers, and provisions the test users
+  (`docker compose --profile tls run --rm tls-ready`); the suite runs it
+  automatically and skips when Docker is unavailable. Requires Docker Compose
+  v5.1.3+. See `docs/AerospikeConfig.md` for details and reset procedures.
 
 ## Packaging and running through Chronon
 

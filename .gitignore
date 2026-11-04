@@ -7,3 +7,4 @@ project/project/
 *.class
 *.log
 .DS_Store
+docker/tls-certs/
